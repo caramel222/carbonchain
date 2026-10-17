@@ -4711,4 +4711,105 @@ mod tests {
         let result = client.try_upgrade(&rando, &fake_hash, &nonce);
         assert!(result.is_err(), "non-admin upgrade must be rejected");
     }
+
+    // ── Tests for Issue #1070: Admin Transfer Flow ────────────────────────────
+
+    #[test]
+    fn test_propose_admin_sets_pending_admin_and_emits_event() {
+        let (env, client, admin, _) = setup();
+        let new_admin = Address::generate(&env);
+        let result = client.try_propose_admin(&admin, &new_admin);
+        assert!(result.is_ok());
+        assert!(!env.events().all().events().is_empty());
+
+        let accept_result = client.try_accept_admin(&new_admin);
+        assert!(accept_result.is_ok());
+    }
+
+    #[test]
+    fn test_accept_admin_by_pending_admin_succeeds_and_emits_event() {
+        let (env, client, admin, _) = setup();
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+
+        let result = client.try_accept_admin(&new_admin);
+        assert!(result.is_ok());
+        assert!(!env.events().all().events().is_empty());
+    }
+
+    #[test]
+    fn test_accept_admin_by_non_pending_address_fails_unauthorized() {
+        let (env, client, admin, _) = setup();
+        let new_admin = Address::generate(&env);
+        let non_pending = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+
+        let result = client.try_accept_admin(&non_pending);
+        assert_eq!(result, Err(Ok(CarbonChainError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_cancel_admin_transfer_by_current_admin_clears_pending_and_emits_event() {
+        let (env, client, admin, _) = setup();
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+
+        let result = client.try_cancel_admin_transfer(&admin);
+        assert!(result.is_ok());
+        assert!(!env.events().all().events().is_empty());
+
+        let accept_result = client.try_accept_admin(&new_admin);
+        assert_eq!(accept_result, Err(Ok(CarbonChainError::NoPendingAdmin)));
+    }
+
+    #[test]
+    fn test_cancel_admin_transfer_by_non_admin_fails_unauthorized() {
+        let (env, client, admin, _) = setup();
+        let new_admin = Address::generate(&env);
+        let non_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+
+        let result = client.try_cancel_admin_transfer(&non_admin);
+        assert_eq!(result, Err(Ok(CarbonChainError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_cancel_admin_transfer_no_pending_fails_no_pending_admin() {
+        let (_env, client, admin, _) = setup();
+        let result = client.try_cancel_admin_transfer(&admin);
+        assert_eq!(result, Err(Ok(CarbonChainError::NoPendingAdmin)));
+    }
+
+    #[test]
+    fn test_double_propose_admin_overwrites_previous() {
+        let (env, client, admin, _) = setup();
+        let new_admin_1 = Address::generate(&env);
+        let new_admin_2 = Address::generate(&env);
+
+        client.propose_admin(&admin, &new_admin_1);
+        client.propose_admin(&admin, &new_admin_2);
+
+        let result1 = client.try_accept_admin(&new_admin_1);
+        assert_eq!(result1, Err(Ok(CarbonChainError::Unauthorized)));
+
+        let result2 = client.try_accept_admin(&new_admin_2);
+        assert!(result2.is_ok());
+    }
+
+    #[test]
+    fn test_propose_admin_non_admin_fails_unauthorized() {
+        let (env, client, _admin, _) = setup();
+        let non_admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        let result = client.try_propose_admin(&non_admin, &new_admin);
+        assert_eq!(result, Err(Ok(CarbonChainError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_accept_admin_no_pending_fails_no_pending_admin() {
+        let (_env, client, _, _) = setup();
+        let new_admin = Address::generate(&env);
+        let result = client.try_accept_admin(&new_admin);
+        assert_eq!(result, Err(Ok(CarbonChainError::NoPendingAdmin)));
+    }
 } // end mod tests
