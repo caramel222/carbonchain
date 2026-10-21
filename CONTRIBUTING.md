@@ -334,6 +334,7 @@ npx tsc --noEmit
 - Use Angular Signals for local state — avoid direct `BehaviorSubject` patterns where signals suffice
 - All HTTP calls go through `ApiService` — never use `HttpClient` directly in components
 - All wallet interactions go through `StellarWalletService`
+- No `console.log`, `console.debug`, or `console.info` in production code — the `no-console` ESLint rule disallows them. `console.error` and `console.warn` are still permitted for error reporting. Debug logging must be removed before opening a PR.
 
 ### General Guidelines
 
@@ -572,12 +573,12 @@ Codes are allocated by range per contract:
 
 | Range | Contract |
 |-------|----------|
-| 100–125 | Credit Registry |
-| 110–118 | Retirement |
-| 115–125 | Marketplace |
-| 119–129 | MRV Oracle |
+| 100–132 | Credit Registry |
+| 200–210 | Retirement |
+| 300–316 | Marketplace |
+| 400–412 | MRV Oracle |
 
-When adding a new error code, pick the **next available number** within the contract's range. The overall range is 100–138; once a range is exhausted, expand upward into the shared buffer (130–138).
+When adding a new error code, pick the **next available number** within the contract's range. Code ranges are non-overlapping (100–132, 200–210, 300–316, 400–412); once a range is exhausted, expand upward while preserving the gap between contracts.
 
 ### Steps
 
