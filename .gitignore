@@ -1,12 +1,15 @@
 # ── Node / JavaScript ─────────────────────────────────────────────────────────
 node_modules/
 dist/
+build/
 .angular/
 .nest/
 .npm/
 .yarn/
 yarn.lock
 pnpm-lock.yaml
+*.tgz
+*.tar.gz
 
 # Packed npm tarballs
 *.tgz
@@ -45,6 +48,10 @@ __snapshots__/
 *.test-snapshot
 test_snapshots/
 **/test_snapshots/
+testsnapshot/
+**/testsnapshot/
+test-snapshot/
+**/test-snapshot/
 
 # Test result / reporter output
 junit.xml

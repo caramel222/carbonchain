@@ -84,6 +84,20 @@ pub struct Offer {
     pub expires_at: Option<u64>,
 }
 
+/// Aggregate marketplace statistics returned by `get_marketplace_stats`.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct MarketplaceStats {
+    /// Total number of offers ever created (including closed/cancelled).
+    pub total_offers: u64,
+    /// Number of currently active (open, non-expired) offers.
+    pub active_offers: u64,
+    /// Cumulative XLM volume (in stroops) across all completed buy_offer calls.
+    pub total_volume_xlm: i128,
+    /// Cumulative token volume per token address for SAC-token-based offers.
+    pub total_volume_tokens: Map<Address, i128>,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -102,6 +116,8 @@ pub enum DataKey {
     TrustedRegistry,
     /// Allowed payment-token contract address stored at initialisation (#691).
     AllowedToken,
+    /// Reverse index: credit_id → offer_id for O(1) lookup by credit (#1089).
+    CreditOffer(BytesN<32>),
 }
 
 /// Stable error codes for the CarbonChain marketplace contract.
@@ -208,6 +224,13 @@ fn get_nonce(env: &Env, addr: &Address) -> u64 {
         .unwrap_or(0u64)
 }
 
+/// #1095 — no-op migration stub. Called by `upgrade` before swapping WASM.
+/// Future schema migrations go here as the contract evolves.
+fn run_migrations(_env: &Env) {
+    // No-op for v1 → v2 transition.
+    // Add field back-fills or index rebuilds here in future versions.
+}
+
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl Marketplace {
@@ -278,6 +301,83 @@ impl Marketplace {
             .unwrap_or(false)
     }
 
+    // ── #1095 — Version / Migration ─────────────────────────────────────────
+
+    /// Returns the current schema version of the contract.
+    pub fn get_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(1u32)
+    }
+
+    // ── #1096 — Allowed token management ────────────────────────────────────
+
+    /// Returns the list of admin-approved SAC token addresses.
+    pub fn get_allowed_tokens(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Add a token address to the admin-approved allowed list.
+    ///
+    /// # Errors
+    /// - [`MarketplaceError::NotInitialized`] / [`MarketplaceError::Unauthorized`]
+    pub fn add_allowed_token(
+        env: Env,
+        admin: Address,
+        token: Address,
+        nonce: u64,
+    ) -> Result<(), MarketplaceError> {
+        Self::require_admin(&env, &admin)?;
+        if !Self::consume_nonce(&env, &admin, nonce) {
+            return Err(MarketplaceError::InvalidNonce);
+        }
+        let mut tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env));
+        // Only add if not already present
+        if !tokens.iter().any(|t| t == token) {
+            tokens.push_back(token);
+            env.storage()
+                .instance()
+                .set(&DataKey::AllowedTokens, &tokens);
+        }
+        Ok(())
+    }
+
+    /// Remove a token address from the admin-approved allowed list.
+    ///
+    /// # Errors
+    /// - [`MarketplaceError::NotInitialized`] / [`MarketplaceError::Unauthorized`]
+    pub fn remove_allowed_token(
+        env: Env,
+        admin: Address,
+        token: Address,
+        nonce: u64,
+    ) -> Result<(), MarketplaceError> {
+        Self::require_admin(&env, &admin)?;
+        if !Self::consume_nonce(&env, &admin, nonce) {
+            return Err(MarketplaceError::InvalidNonce);
+        }
+        let mut tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env));
+        if let Some(pos) = tokens.iter().position(|t| t == token) {
+            tokens.remove(pos as u32);
+            env.storage()
+                .instance()
+                .set(&DataKey::AllowedTokens, &tokens);
+        }
+        Ok(())
+    }
+
     // ── Offers ───────────────────────────────────────────────────────────────
 
     /// List a credit for sale with XLM pricing. Returns the new offer ID.
@@ -329,7 +429,8 @@ impl Marketplace {
     /// The buyer must hold enough of the specified asset before calling [`buy_offer`].
     ///
     /// # Errors
-    /// Same as [`create_offer`].
+    /// Same as [`create_offer`], plus:
+    /// - [`MarketplaceError::InvalidToken`] — `price_asset` is not in the allowed list.
     pub fn create_offer_with_asset(
         env: Env,
         seller: Address,
@@ -341,6 +442,12 @@ impl Marketplace {
         expires_at: Option<u64>,
         nonce: u64,
     ) -> Result<u64, MarketplaceError> {
+        // #1096 — validate SAC token is in allowed list
+        if let AssetType::Asset(ref sac) = price_asset {
+            if !Self::is_token_allowed(&env, sac) {
+                return Err(MarketplaceError::InvalidToken);
+            }
+        }
         Self::create_offer_internal(
             env,
             seller,
@@ -412,6 +519,13 @@ impl Marketplace {
             return Err(MarketplaceError::InvalidTonnes);
         }
 
+        // #1092: validate expires_at is strictly in the future
+        if let Some(exp) = expires_at {
+            if exp <= env.ledger().timestamp() {
+                return Err(MarketplaceError::InvalidExpiry);
+            }
+        }
+
         let registry_nonce: u64 = env.invoke_contract(
             &registry_id,
             &Symbol::new(&env, "get_nonce"),
@@ -455,6 +569,16 @@ impl Marketplace {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Offer(offer_id), TTL_THRESHOLD, MIN_TTL);
+
+        // #1089: reverse index — credit_id → offer_id for O(1) lookup
+        env.storage()
+            .persistent()
+            .set(&DataKey::CreditOffer(credit_id.clone()), &offer_id);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CreditOffer(credit_id.clone()),
+            TTL_THRESHOLD,
+            MIN_TTL,
+        );
 
         // Store escrowed amount for refund on cancellation
         env.storage()
@@ -628,6 +752,11 @@ impl Marketplace {
             .persistent()
             .remove(&DataKey::EscrowedAmount(offer_id));
 
+        // #1089: remove credit_id reverse index now that the offer is closed
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CreditOffer(offer.credit_id.clone()));
+
         // Remove from global active index
         let mut active_ids: Vec<u64> = env
             .storage()
@@ -643,6 +772,9 @@ impl Marketplace {
                 .persistent()
                 .extend_ttl(&DataKey::ActiveOffers, TTL_THRESHOLD, MIN_TTL);
         }
+
+        // #1091: decrement active offers counter
+        Self::decrement_active_count(&env);
 
         OfferCxl {
             seller: seller.clone(),
@@ -961,6 +1093,7 @@ impl Marketplace {
     /// - [`MarketplaceError::AlreadyClosed`] — offer has already been cancelled/filled.
     /// - [`MarketplaceError::OfferExpired`] — offer has expired.
     /// - [`MarketplaceError::InsufficientFunds`] — buyer balance is less than `price_amount`.
+    /// - [`MarketplaceError::InvalidToken`] — SAC token is not in the allowed list.
     /// - [`MarketplaceError::Overflow`] — price is zero or negative (corrupt state).
     pub fn buy_offer(
         env: Env,
@@ -1070,6 +1203,11 @@ impl Marketplace {
             .persistent()
             .remove(&DataKey::EscrowedAmount(offer_id));
 
+        // #1089: remove credit_id reverse index now that the offer is filled
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CreditOffer(offer.credit_id.clone()));
+
         // Remove from global active index
         let mut active_ids: Vec<u64> = env
             .storage()
@@ -1085,6 +1223,38 @@ impl Marketplace {
                 .persistent()
                 .extend_ttl(&DataKey::ActiveOffers, TTL_THRESHOLD, MIN_TTL);
         }
+
+        // #1091: decrement active offers counter and accumulate volume
+        Self::decrement_active_count(&env);
+        // All marketplace offers are priced in native XLM (price_xlm in stroops).
+        // Accumulate into TotalVolumeXLM; TotalVolumeTokens tracks SAC-token-based
+        // volume if token_id differs from the native XLM contract in future extensions.
+        let prev_xlm_vol: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalVolumeXLM)
+            .unwrap_or(0i128);
+        let new_xlm_vol = prev_xlm_vol.saturating_add(price);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalVolumeXLM, &new_xlm_vol);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TotalVolumeXLM, TTL_THRESHOLD, MIN_TTL);
+        // Also record per-token volume so callers can distinguish native XLM vs SAC tokens.
+        let mut token_vol: Map<Address, i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalVolumeTokens)
+            .unwrap_or_else(|| Map::new(&env));
+        let prev_tok_vol: i128 = token_vol.get(token_id.clone()).unwrap_or(0i128);
+        token_vol.set(token_id, prev_tok_vol.saturating_add(price));
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalVolumeTokens, &token_vol);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TotalVolumeTokens, TTL_THRESHOLD, MIN_TTL);
 
         Ok(())
     }
@@ -1155,7 +1325,96 @@ impl Marketplace {
         Self::list_active_offers(env, page, page_size)
     }
 
+    /// Look up the active offer ID for a given `credit_id` in O(1). (#1089)
+    ///
+    /// Returns `Some(offer_id)` if there is a current (non-cancelled, non-filled)
+    /// offer for the credit, or `None` if no offer exists or the offer has been
+    /// closed/filled.
+    pub fn get_offer_by_credit_id(env: Env, credit_id: BytesN<32>) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CreditOffer(credit_id))
+    }
+
+    /// Paginated list of ALL offer IDs for a seller (including cancelled/filled). (#1090)
+    ///
+    /// `page` is 0-indexed.  `page_size` is clamped to 50.
+    /// Returns an empty vector when `page` is past the end or the seller has no offers.
+    pub fn list_offers_by_seller_paginated(
+        env: Env,
+        seller: Address,
+        page: u32,
+        page_size: u32,
+    ) -> Vec<u64> {
+        let page_size = page_size.min(50) as usize;
+        let all_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SellerOffers(seller))
+            .unwrap_or_else(|| Vec::new(&env));
+        let start = (page as usize) * page_size;
+        let mut result = Vec::new(&env);
+        let end = start.saturating_add(page_size).min(all_ids.len() as usize);
+        for i in start..end {
+            result.push_back(all_ids.get(i as u32).unwrap());
+        }
+        result
+    }
+
+    /// Paginated list of ACTIVE offer IDs for a seller (excludes cancelled/filled/expired). (#1090)
+    ///
+    /// `page` is 0-indexed.  `page_size` is clamped to 50.
+    /// Returns an empty vector when `page` is past the end or the seller has no active offers.
+    pub fn list_active_offers_by_seller_paginated(
+        env: Env,
+        seller: Address,
+        page: u32,
+        page_size: u32,
+    ) -> Vec<u64> {
+        let page_size = page_size.min(50) as usize;
+        let all_active = Self::get_active_offers_by_seller(env.clone(), seller);
+        let start = (page as usize) * page_size;
+        let mut result = Vec::new(&env);
+        let end = start.saturating_add(page_size).min(all_active.len() as usize);
+        for i in start..end {
+            result.push_back(all_active.get(i as u32).unwrap());
+        }
+        result
+    }
+
     // ── Internal ─────────────────────────────────────────────────────────────
+
+    /// Increment `ActiveOffersCount` by one. Called when a new active offer is created.
+    fn increment_active_count(env: &Env) {
+        let count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveOffersCount)
+            .unwrap_or(0u64);
+        let new_count = count.saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveOffersCount, &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ActiveOffersCount, TTL_THRESHOLD, MIN_TTL);
+    }
+
+    /// Decrement `ActiveOffersCount` by one (saturating at zero). Called on cancel or buy.
+    fn decrement_active_count(env: &Env) {
+        let count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveOffersCount)
+            .unwrap_or(0u64);
+        let new_count = count.saturating_sub(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveOffersCount, &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ActiveOffersCount, TTL_THRESHOLD, MIN_TTL);
+    }
 
     fn next_id(env: &Env) -> Result<u64, MarketplaceError> {
         let id: u64 = env
@@ -1256,6 +1515,16 @@ impl Marketplace {
         true
     }
 
+    /// #1096 — returns true if the given token address is in the allowed list.
+    fn is_token_allowed(env: &Env, token: &Address) -> bool {
+        let tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(env));
+        tokens.iter().any(|t| &t == token)
+    }
+
     pub fn get_nonce(env: Env, address: Address) -> u64 {
         get_nonce(&env, &address)
     }
@@ -1263,6 +1532,13 @@ impl Marketplace {
     // ── Contract Upgrade ─────────────────────────────────────────────────────
 
     /// Upgrade the contract WASM to a new hash. Only the admin may call this.
+    ///
+    /// Execution order:
+    /// 1. Validate admin identity and nonce.
+    /// 2. Run `run_migrations` (any schema changes for the new version).
+    /// 3. Increment `DataKey::Version`.
+    /// 4. Swap the WASM.
+    /// 5. Emit `ContractUpgraded` event.
     ///
     /// # Errors
     /// - [`MarketplaceError::NotInitialized`] — contract has not been initialised.
@@ -1278,7 +1554,21 @@ impl Marketplace {
         if !Self::consume_nonce(&env, &admin, nonce) {
             return Err(MarketplaceError::InvalidNonce);
         }
+        // Run migrations BEFORE swapping WASM so the new code sees migrated state.
+        run_migrations(&env);
+        // Increment version
+        let current_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(1u32);
+        let new_version = current_version + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &new_version);
+        // Swap WASM
         env.deployer().update_current_contract_wasm(new_wasm_hash);
+        ContractUpgraded { admin, new_version }.publish(&env);
         Ok(())
     }
 }
@@ -2672,5 +2962,668 @@ mod tests {
             &seller_nonce,
         );
         assert_eq!(result, Err(Ok(MarketplaceError::CreditNotFound)));
+    }
+
+    // ── Issue #1089: get_offer_by_credit_id ───────────────────────────────────
+
+    /// Happy path: after creating an offer, lookup by credit_id returns the correct offer_id.
+    #[test]
+    fn test_get_offer_by_credit_id_happy_path() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, _admin, registry, credit_id) = setup_with_registry(&env);
+        let seller_nonce = client.get_nonce(&seller);
+        let offer_id = client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &None,
+            &seller_nonce,
+        );
+        let result = client.get_offer_by_credit_id(&credit_id);
+        assert_eq!(result, Some(offer_id));
+    }
+
+    /// Not found: a credit with no offer returns None.
+    #[test]
+    fn test_get_offer_by_credit_id_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _seller, _admin, _registry, credit_id) = setup_with_registry(&env);
+        // No offer created — lookup must return None
+        let result = client.get_offer_by_credit_id(&credit_id);
+        assert_eq!(result, None);
+    }
+
+    /// After cancel: the reverse index is removed, so lookup returns None.
+    #[test]
+    fn test_get_offer_by_credit_id_after_cancel() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, _admin, registry, credit_id) = setup_with_registry(&env);
+        let seller_nonce = client.get_nonce(&seller);
+        let offer_id = client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &None,
+            &seller_nonce,
+        );
+        // Confirm it's there before cancel
+        assert_eq!(client.get_offer_by_credit_id(&credit_id), Some(offer_id));
+        let seller_nonce2 = client.get_nonce(&seller);
+        client.cancel_offer(&seller, &offer_id, &registry.id, &seller_nonce2);
+        // After cancel, reverse index must be gone
+        assert_eq!(client.get_offer_by_credit_id(&credit_id), None);
+    }
+
+    /// After buy: the reverse index is removed, so lookup returns None.
+    #[test]
+    fn test_get_offer_by_credit_id_after_buy() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, _admin, registry, credit_id, token) = setup_with_token(&env);
+        let price = 10_000_000i128;
+        let seller_nonce = client.get_nonce(&seller);
+        let offer_id = client.create_offer(
+            &seller,
+            &credit_id,
+            &price,
+            &500_000,
+            &registry.id,
+            &None,
+            &seller_nonce,
+        );
+        // Confirm it's there before buy
+        assert_eq!(client.get_offer_by_credit_id(&credit_id), Some(offer_id));
+        let buyer = Address::generate(&env);
+        token.set_balance(&buyer, &price);
+        let buyer_nonce = client.get_nonce(&buyer);
+        client.buy_offer(&buyer, &offer_id, &registry.id, &token.address, &buyer_nonce);
+        // After purchase, reverse index must be gone
+        assert_eq!(client.get_offer_by_credit_id(&credit_id), None);
+    }
+
+    // ── Issue #1090: list_offers_by_seller_paginated ──────────────────────────
+
+    /// First page (page=0) returns expected offer IDs.
+    #[test]
+    fn test_list_offers_by_seller_paginated_first_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, _admin, registry, credit_id) = setup_with_registry(&env);
+
+        // Create one offer, cancel it (returns credit), create a second one
+        let nonce0 = client.get_nonce(&seller);
+        let id0 = client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &None,
+            &nonce0,
+        );
+        let nonce_cancel = client.get_nonce(&seller);
+        client.cancel_offer(&seller, &id0, &registry.id, &nonce_cancel);
+        let nonce1 = client.get_nonce(&seller);
+        let id1 = client.create_offer(
+            &seller,
+            &credit_id,
+            &20_000_000,
+            &500_000,
+            &registry.id,
+            &None,
+            &nonce1,
+        );
+
+        let page0 = client.list_offers_by_seller_paginated(&seller, &0, &10);
+        assert_eq!(page0.len(), 2);
+        assert_eq!(page0.get(0).unwrap(), id0);
+        assert_eq!(page0.get(1).unwrap(), id1);
+    }
+
+    /// Second page (page=1) returns the right slice.
+    #[test]
+    fn test_list_offers_by_seller_paginated_second_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, _admin, registry, credit_id) = setup_with_registry(&env);
+
+        // Create three offers (cancel between each to free credit)
+        let n0 = client.get_nonce(&seller);
+        let id0 = client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &None,
+            &n0,
+        );
+        let nc0 = client.get_nonce(&seller);
+        client.cancel_offer(&seller, &id0, &registry.id, &nc0);
+
+        let n1 = client.get_nonce(&seller);
+        let id1 = client.create_offer(
+            &seller,
+            &credit_id,
+            &20_000_000,
+            &500_000,
+            &registry.id,
+            &None,
+            &n1,
+        );
+        let nc1 = client.get_nonce(&seller);
+        client.cancel_offer(&seller, &id1, &registry.id, &nc1);
+
+        let n2 = client.get_nonce(&seller);
+        let id2 = client.create_offer(
+            &seller,
+            &credit_id,
+            &30_000_000,
+            &500_000,
+            &registry.id,
+            &None,
+            &n2,
+        );
+        let nc2 = client.get_nonce(&seller);
+        client.cancel_offer(&seller, &id2, &registry.id, &nc2);
+
+        // page_size=2: page0=[id0,id1], page1=[id2]
+        let page1 = client.list_offers_by_seller_paginated(&seller, &1, &2);
+        assert_eq!(page1.len(), 1);
+        assert_eq!(page1.get(0).unwrap(), id2);
+    }
+
+    /// Past end (page=999) returns empty vec.
+    #[test]
+    fn test_list_offers_by_seller_paginated_past_end() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, _admin, registry, credit_id) = setup_with_registry(&env);
+        let nonce = client.get_nonce(&seller);
+        client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &None,
+            &nonce,
+        );
+        let result = client.list_offers_by_seller_paginated(&seller, &999, &10);
+        assert_eq!(result.len(), 0);
+    }
+
+    /// page_size > 50 is capped at 50.
+    #[test]
+    fn test_list_offers_by_seller_paginated_page_size_capped() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, _admin, registry, credit_id) = setup_with_registry(&env);
+        let nonce = client.get_nonce(&seller);
+        client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &None,
+            &nonce,
+        );
+        // With page_size=200 (capped to 50) and only 1 offer, result has 1 element
+        let result = client.list_offers_by_seller_paginated(&seller, &0, &200);
+        assert_eq!(result.len(), 1);
+    }
+
+    /// Non-existent seller returns empty vec.
+    #[test]
+    fn test_list_offers_by_seller_paginated_nonexistent_seller() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _seller, _admin, _registry, _credit_id) = setup_with_registry(&env);
+        let nobody = Address::generate(&env);
+        let result = client.list_offers_by_seller_paginated(&nobody, &0, &10);
+        assert_eq!(result.len(), 0);
+    }
+
+    /// list_active_offers_by_seller_paginated — first page of active offers.
+    #[test]
+    fn test_list_active_offers_by_seller_paginated_first_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, _admin, registry, credit_id) = setup_with_registry(&env);
+
+        let n0 = client.get_nonce(&seller);
+        let id0 = client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &None,
+            &n0,
+        );
+        // Cancel it to return credit
+        let nc0 = client.get_nonce(&seller);
+        client.cancel_offer(&seller, &id0, &registry.id, &nc0);
+        // Create a second active offer
+        let n1 = client.get_nonce(&seller);
+        let id1 = client.create_offer(
+            &seller,
+            &credit_id,
+            &20_000_000,
+            &500_000,
+            &registry.id,
+            &None,
+            &n1,
+        );
+
+        // Only the active offer (id1) should appear
+        let page0 = client.list_active_offers_by_seller_paginated(&seller, &0, &10);
+        assert_eq!(page0.len(), 1);
+        assert_eq!(page0.get(0).unwrap(), id1);
+    }
+
+    /// list_active_offers_by_seller_paginated — non-existent seller returns empty.
+    #[test]
+    fn test_list_active_offers_by_seller_paginated_nonexistent_seller() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _seller, _admin, _registry, _credit_id) = setup_with_registry(&env);
+        let nobody = Address::generate(&env);
+        let result = client.list_active_offers_by_seller_paginated(&nobody, &0, &10);
+        assert_eq!(result.len(), 0);
+    }
+
+    /// list_active_offers_by_seller_paginated — past end returns empty.
+    #[test]
+    fn test_list_active_offers_by_seller_paginated_past_end() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, _admin, registry, credit_id) = setup_with_registry(&env);
+        let nonce = client.get_nonce(&seller);
+        client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &None,
+            &nonce,
+        );
+        let result = client.list_active_offers_by_seller_paginated(&seller, &999, &10);
+        assert_eq!(result.len(), 0);
+    }
+
+    // ── Issue #1087: cleanup_expired_offers tests ─────────────────────────────
+
+    /// Admin can call cleanup_expired_offers with start_id=0, limit=10.
+    #[test]
+    fn test_cleanup_expired_offers_admin_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, admin, registry, credit_id) = setup_with_registry(&env);
+        let now = env.ledger().timestamp();
+        let expires_at = now + 100;
+
+        let nonce = client.get_nonce(&seller);
+        client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &Some(expires_at),
+            &nonce,
+        );
+
+        // Advance past expiry
+        env.ledger().set_timestamp(expires_at + 1);
+        let result = client.try_cleanup_expired_offers(&admin, &0, &10);
+        assert!(result.is_ok());
+    }
+
+    /// Non-admin caller is rejected with Unauthorized.
+    #[test]
+    fn test_cleanup_expired_offers_non_admin_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _seller, _admin, _registry, _credit_id) = setup_with_registry(&env);
+        let rando = Address::generate(&env);
+        let result = client.try_cleanup_expired_offers(&rando, &0, &10);
+        assert!(result.is_err());
+    }
+
+    /// Expired offers are marked inactive and removed from the ActiveOffers index.
+    #[test]
+    fn test_cleanup_expired_offers_marks_inactive_and_removes_from_active_index() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, admin, registry, credit_id) = setup_with_registry(&env);
+        let now = env.ledger().timestamp();
+        let expires_at = now + 100;
+
+        let nonce = client.get_nonce(&seller);
+        let offer_id = client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &Some(expires_at),
+            &nonce,
+        );
+
+        // Offer is in the active index before cleanup
+        assert_eq!(client.get_active_offers().len(), 1);
+
+        // Advance past expiry and clean up
+        env.ledger().set_timestamp(expires_at + 1);
+        client.cleanup_expired_offers(&admin, &0, &10);
+
+        // Offer should now be inactive
+        let offer = client.get_offer(&offer_id);
+        assert!(!offer.active);
+
+        // Active index must be empty
+        assert_eq!(client.get_active_offers().len(), 0);
+    }
+
+    /// Expired offers are removed from the SellerOffers index by cleanup_expired_offers.
+    #[test]
+    fn test_cleanup_expired_offers_removes_from_seller_index() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, admin, registry, credit_id) = setup_with_registry(&env);
+        let now = env.ledger().timestamp();
+        let expires_at = now + 100;
+
+        let nonce = client.get_nonce(&seller);
+        client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &Some(expires_at),
+            &nonce,
+        );
+
+        // Seller index has 1 entry before cleanup
+        assert_eq!(client.get_offers_by_seller(&seller).len(), 1);
+
+        // Advance past expiry and clean up
+        env.ledger().set_timestamp(expires_at + 1);
+        client.cleanup_expired_offers(&admin, &0, &10);
+
+        // Seller index must now be empty (the key is removed when empty)
+        assert_eq!(client.get_offers_by_seller(&seller).len(), 0);
+    }
+
+    /// Non-expired offers are NOT touched by cleanup_expired_offers.
+    #[test]
+    fn test_cleanup_expired_offers_leaves_non_expired_untouched() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, admin, registry, credit_id) = setup_with_registry(&env);
+        let now = env.ledger().timestamp();
+        // Offer expires far in the future
+        let expires_at = now + 10_000;
+
+        let nonce = client.get_nonce(&seller);
+        let offer_id = client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &Some(expires_at),
+            &nonce,
+        );
+
+        // Run cleanup without advancing time — offer should be untouched
+        client.cleanup_expired_offers(&admin, &0, &10);
+
+        assert!(client.get_offer(&offer_id).active);
+        assert_eq!(client.get_active_offers().len(), 1);
+    }
+
+    /// Limit is capped at 100 — passing limit=200 behaves identically to limit=100.
+    #[test]
+    fn test_cleanup_expired_offers_limit_capped_at_100() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, admin, registry, credit_id) = setup_with_registry(&env);
+        let now = env.ledger().timestamp();
+        let expires_at = now + 100;
+
+        let nonce = client.get_nonce(&seller);
+        let offer_id = client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &Some(expires_at),
+            &nonce,
+        );
+
+        // Advance past expiry; pass limit=200 (should behave like limit=100)
+        env.ledger().set_timestamp(expires_at + 1);
+        let result = client.try_cleanup_expired_offers(&admin, &0, &200);
+        assert!(result.is_ok());
+        // Offer was still cleaned up
+        assert!(!client.get_offer(&offer_id).active);
+    }
+
+    /// Multiple expired offers at different offer_ids are all cleaned up.
+    #[test]
+    fn test_cleanup_expired_offers_multiple_expired() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, admin, registry, credit_id) = setup_with_registry(&env);
+        let now = env.ledger().timestamp();
+        let expires_at = now + 100;
+
+        // Create offer, cancel to return credit, then create second offer with expiry
+        let n0 = client.get_nonce(&seller);
+        let id0 = client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &Some(expires_at),
+            &n0,
+        );
+        let nc0 = client.get_nonce(&seller);
+        client.cancel_offer(&seller, &id0, &registry.id, &nc0);
+
+        let n1 = client.get_nonce(&seller);
+        let id1 = client.create_offer(
+            &seller,
+            &credit_id,
+            &20_000_000,
+            &500_000,
+            &registry.id,
+            &Some(expires_at),
+            &n1,
+        );
+        let nc1 = client.get_nonce(&seller);
+        client.cancel_offer(&seller, &id1, &registry.id, &nc1);
+
+        let n2 = client.get_nonce(&seller);
+        let id2 = client.create_offer(
+            &seller,
+            &credit_id,
+            &30_000_000,
+            &500_000,
+            &registry.id,
+            &Some(expires_at),
+            &n2,
+        );
+
+        // 3 offers total; id0 and id1 are already cancelled; id2 is active + expiring
+        assert_eq!(client.get_active_offers().len(), 1);
+
+        env.ledger().set_timestamp(expires_at + 1);
+        client.cleanup_expired_offers(&admin, &0, &10);
+
+        // id2 must now be inactive
+        assert!(!client.get_offer(&id2).active);
+        assert_eq!(client.get_active_offers().len(), 0);
+    }
+
+    // ── Issue #1088: cleanup_seller_offers tests ──────────────────────────────
+
+    /// Seller with a mix of active/cancelled offers — only active remain after cleanup.
+    #[test]
+    fn test_cleanup_seller_offers_only_active_remain() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, _admin, registry, credit_id) = setup_with_registry(&env);
+
+        // Create an offer and cancel it (inactive), then create a second (active)
+        let n0 = client.get_nonce(&seller);
+        let id0 = client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &None,
+            &n0,
+        );
+        let nc0 = client.get_nonce(&seller);
+        client.cancel_offer(&seller, &id0, &registry.id, &nc0);
+
+        let n1 = client.get_nonce(&seller);
+        let id1 = client.create_offer(
+            &seller,
+            &credit_id,
+            &20_000_000,
+            &500_000,
+            &registry.id,
+            &None,
+            &n1,
+        );
+
+        // Before cleanup: seller index has 2 entries
+        assert_eq!(client.get_offers_by_seller(&seller).len(), 2);
+
+        let pruned = client.cleanup_seller_offers(&seller);
+        // id0 was inactive → pruned
+        assert_eq!(pruned, 1);
+
+        // After cleanup only the active offer remains
+        let remaining = client.get_offers_by_seller(&seller);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining.get(0).unwrap(), id1);
+    }
+
+    /// cleanup_seller_offers returns the count of pruned entries.
+    #[test]
+    fn test_cleanup_seller_offers_returns_pruned_count() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, _admin, registry, credit_id) = setup_with_registry(&env);
+
+        let n0 = client.get_nonce(&seller);
+        let id0 = client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &None,
+            &n0,
+        );
+        // Cancel the offer (makes it inactive)
+        let nc0 = client.get_nonce(&seller);
+        client.cancel_offer(&seller, &id0, &registry.id, &nc0);
+
+        let pruned = client.cleanup_seller_offers(&seller);
+        assert_eq!(pruned, 1);
+    }
+
+    /// If all offers are pruned, the seller index key is removed entirely.
+    #[test]
+    fn test_cleanup_seller_offers_removes_index_when_all_pruned() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, _admin, registry, credit_id) = setup_with_registry(&env);
+
+        let n0 = client.get_nonce(&seller);
+        let id0 = client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &None,
+            &n0,
+        );
+        let nc0 = client.get_nonce(&seller);
+        client.cancel_offer(&seller, &id0, &registry.id, &nc0);
+
+        // All offers inactive — cleanup should remove the key
+        client.cleanup_seller_offers(&seller);
+
+        // get_offers_by_seller returns empty (storage key was removed)
+        assert_eq!(client.get_offers_by_seller(&seller).len(), 0);
+    }
+
+    /// Expired offers (past expires_at) are pruned by cleanup_seller_offers.
+    #[test]
+    fn test_cleanup_seller_offers_prunes_expired() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, seller, _admin, registry, credit_id) = setup_with_registry(&env);
+        let now = env.ledger().timestamp();
+        let expires_at = now + 100;
+
+        let nonce = client.get_nonce(&seller);
+        let offer_id = client.create_offer(
+            &seller,
+            &credit_id,
+            &10_000_000,
+            &500_000,
+            &registry.id,
+            &Some(expires_at),
+            &nonce,
+        );
+
+        // Advance past expiry
+        env.ledger().set_timestamp(expires_at + 1);
+
+        // Offer is still technically "active" in storage but has expired —
+        // cleanup_seller_offers must prune it
+        let pruned = client.cleanup_seller_offers(&seller);
+        assert_eq!(pruned, 1);
+
+        // The seller index should now be empty
+        assert_eq!(client.get_offers_by_seller(&seller).len(), 0);
+
+        // The offer itself still exists in storage (cleanup_seller_offers does
+        // not mutate the offer record — it only compacts the index)
+        let offer = client.get_offer(&offer_id);
+        assert!(offer.active); // still stored as active — only index was removed
+    }
+
+    /// Non-existent seller returns 0 pruned entries.
+    #[test]
+    fn test_cleanup_seller_offers_nonexistent_seller_returns_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _seller, _admin, _registry, _credit_id) = setup_with_registry(&env);
+        let nobody = Address::generate(&env);
+        let pruned = client.cleanup_seller_offers(&nobody);
+        assert_eq!(pruned, 0);
     }
 }
